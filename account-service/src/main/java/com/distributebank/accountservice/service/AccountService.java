@@ -8,6 +8,7 @@ import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.data.redis.core.RedisTemplate;
 import org.springframework.data.redis.core.script.DefaultRedisScript;
+import org.springframework.orm.ObjectOptimisticLockingFailureException;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -19,6 +20,7 @@ import java.util.List;
 /**
  * 账户服务业务逻辑类
  * 负责账户余额管理和扣款逻辑，使用Redis Lua脚本保证原子性
+ * 结合乐观锁和延时双删策略保证数据一致性
  */
 @Service
 @RequiredArgsConstructor
@@ -27,6 +29,7 @@ public class AccountService {
     
     private final AccountRepository accountRepository;
     private final RedisTemplate<String, String> redisTemplate;
+    private final CacheService cacheService;
     
     private static final String ACCOUNT_BALANCE_PREFIX = "account:balance:";
     private static final String TRANSACTION_PROCESSED_PREFIX = "transaction:processed:";
@@ -64,21 +67,20 @@ public class AccountService {
         "return {1, tostring(newBalance)}";
     
     /**
-     * 查询账户余额（优先从Redis获取）
+     * 获取账户余额（优先从Redis获取）
      */
     public BigDecimal getBalance(String accountId) {
-        String balanceKey = ACCOUNT_BALANCE_PREFIX + accountId;
-        String balance = redisTemplate.opsForValue().get(balanceKey);
-        
-        if (balance != null) {
-            return new BigDecimal(balance);
+        // 先从Redis获取
+        String cachedBalance = cacheService.getCache(accountId);
+        if (cachedBalance != null) {
+            return new BigDecimal(cachedBalance);
         }
         
-        // Redis中没有，从数据库获取并同步到Redis
+        // Redis没有，从数据库获取并缓存
         Account account = accountRepository.findByAccountId(accountId)
                 .orElseThrow(() -> new RuntimeException("账户不存在: " + accountId));
         
-        redisTemplate.opsForValue().set(balanceKey, account.getBalance().toString());
+        cacheService.setCache(accountId, account.getBalance().toString());
         return account.getBalance();
     }
     
@@ -112,6 +114,7 @@ public class AccountService {
                 .bankCode(request.getBankCode())
                 .balance(request.getInitialBalance() != null ? request.getInitialBalance() : BigDecimal.ZERO)
                 .status(Account.AccountStatus.ACTIVE)
+                .version(0L)
                 .createdAt(LocalDateTime.now())
                 .updatedAt(LocalDateTime.now())
                 .build();
@@ -119,32 +122,61 @@ public class AccountService {
         accountRepository.save(account);
         
         // 同步余额到Redis
-        String balanceKey = ACCOUNT_BALANCE_PREFIX + account.getAccountId();
-        redisTemplate.opsForValue().set(balanceKey, account.getBalance().toString());
+        cacheService.setCache(account.getAccountId(), account.getBalance().toString());
         
         log.info("创建账户成功: {}", account.getAccountId());
         return account.getAccountId();
     }
     
     /**
-     * 充值账户
+     * 充值账户（乐观锁 + 延时双删）
      */
     @Transactional
     public BigDecimal deposit(String accountId, BigDecimal amount) {
-        Account account = accountRepository.findByAccountId(accountId)
-                .orElseThrow(() -> new RuntimeException("账户不存在: " + accountId));
+        int maxRetries = 3;
+        long delayMs = 500; // 延时500ms
         
-        BigDecimal newBalance = account.getBalance().add(amount);
-        account.setBalance(newBalance);
-        account.setUpdatedAt(LocalDateTime.now());
-        accountRepository.save(account);
+        for (int i = 0; i < maxRetries; i++) {
+            try {
+                // 1. 先删除缓存
+                cacheService.deleteCacheFirst(accountId);
+                
+                // 2. 乐观锁更新数据库
+                Account account = accountRepository.findByAccountId(accountId)
+                        .orElseThrow(() -> new RuntimeException("账户不存在: " + accountId));
+                
+                BigDecimal newBalance = account.getBalance().add(amount);
+                account.setBalance(newBalance);
+                account.setUpdatedAt(LocalDateTime.now());
+                accountRepository.save(account);
+                
+                // 3. 延时删除缓存
+                cacheService.scheduleDelayedDelete(accountId, delayMs);
+                
+                log.info("账户充值成功: {} 金额: {} 新余额: {}", accountId, amount, newBalance);
+                return newBalance;
+                
+            } catch (ObjectOptimisticLockingFailureException e) {
+                if (i == maxRetries - 1) {
+                    log.error("账户充值失败，乐观锁冲突: {}", accountId, e);
+                    throw new RuntimeException("并发冲突，请重试");
+                }
+                // 重试前也删除缓存
+                cacheService.deleteCache(accountId);
+                log.warn("账户充值乐观锁冲突，重试第{}次: {}", i + 1, accountId);
+                try {
+                    Thread.sleep(10 * (i + 1)); // 递增延时
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    throw new RuntimeException("充值操作被中断");
+                }
+            } catch (Exception e) {
+                log.error("账户充值异常: {}", accountId, e);
+                throw new RuntimeException("充值失败: " + e.getMessage());
+            }
+        }
         
-        // 同步余额到Redis
-        String balanceKey = ACCOUNT_BALANCE_PREFIX + accountId;
-        redisTemplate.opsForValue().set(balanceKey, newBalance.toString());
-        
-        log.info("账户充值成功: {} 金额: {} 新余额: {}", accountId, amount, newBalance);
-        return newBalance;
+        throw new RuntimeException("充值失败，重试次数已用完");
     }
     
     /**
